@@ -25,9 +25,8 @@ public:
 
 private:
     rclcpp::Clock::SharedPtr clock_;
-    std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::Imu>> imu_sub_;
-    std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::MagneticField>> mag_sub_;
-    std::shared_ptr<message_filters::TimeSynchronizer<sensor_msgs::msg::Imu, sensor_msgs::msg::MagneticField>> sync_;
+    rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
+    rclcpp::Subscription<sensor_msgs::msg::MagneticField>::SharedPtr mag_sub_;
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr accel_comp_pub_;
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr gravity_pub_;
@@ -56,6 +55,9 @@ private:
     Butter2 butter_wx_;
     Butter2 butter_wy_;
     Butter2 butter_wz_;
+    void imuCallback(const sensor_msgs::msg::Imu::SharedPtr imu_msg);
+    void magCallback(const sensor_msgs::msg::MagneticField::SharedPtr mag_msg);
+    bool synchronizeTimestamps(const rclcpp::Time& imu_time, sensor_msgs::msg::MagneticField::SharedPtr& mag);
 };
 
 #endif // EKF_IMU_H
