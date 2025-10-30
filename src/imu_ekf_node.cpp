@@ -95,10 +95,8 @@ EKF_IMU::EKF_IMU()
     m_ref_.normalize();
 
     // Setup subscribers and publishers
-    imu_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Imu>>(this, imu_topic);
-    mag_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::MagneticField>>(this, mag_topic);
-    sync_ = std::make_shared<message_filters::TimeSynchronizer<sensor_msgs::msg::Imu, sensor_msgs::msg::MagneticField>>(*imu_sub_, *mag_sub_, 10);
-    sync_->registerCallback(&EKF_IMU::syncedCallback, this);
+    imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, std::bind(&EKF_IMU::imuCallback, this, std::placeholders::_1));
+    mag_sub_ = this->create_subscription<sensor_msgs::msg::MagneticField>(mag_topic, 10, std::bind(&EKF_IMU::magCallback, this, std::placeholders::_1));
     imu_pub_ = create_publisher<sensor_msgs::msg::Imu>("/imu/data_ekf", 10);
     accel_comp_pub_ = create_publisher<sensor_msgs::msg::Imu>("/imu/accel_compensated", 10);
     gravity_pub_ = create_publisher<sensor_msgs::msg::Imu>("/imu/gravity_ekf", 10);
@@ -113,13 +111,45 @@ EKF_IMU::EKF_IMU()
                 filter_gyro_ ? "true" : "false", coordinate_frame.c_str(), mag_bias_(0), mag_bias_(1), mag_bias_(2));
 }
 
-void EKF_IMU::syncedCallback(const sensor_msgs::msg::Imu::SharedPtr imu_msg, const sensor_msgs::msg::MagneticField::SharedPtr mag_msg)
-{
+void EKF_IMU::imuCallback(const sensor_msgs::msg::Imu::SharedPtr imu_msg) {
     if (imu_msg->header.stamp.sec == 0 && imu_msg->header.stamp.nanosec == 0) {
         RCLCPP_WARN(get_logger(), "Received IMU message with invalid timestamp, skipping");
         return;
     }
 
+    rclcpp::Time imu_time(imu_msg->header.stamp, clock_->get_clock_type());
+    sensor_msgs::msg::MagneticField::SharedPtr mag_to_use = nullptr;
+    if (use_magnetometer_ && has_recent_mag_) {
+        synchronizeTimestamps(imu_time, mag_to_use);
+    }
+    syncedCallback(imu_msg, mag_to_use);
+}
+
+void EKF_IMU::magCallback(const sensor_msgs::msg::MagneticField::SharedPtr mag_msg) {
+    if (mag_msg->header.stamp.sec == 0 && mag_msg->header.stamp.nanosec == 0) {
+        RCLCPP_WARN(get_logger(), "Received Mag message with invalid timestamp, skipping");
+        return;
+    }
+    last_mag_msg_ = *mag_msg;
+    last_mag_time_ = rclcpp::Time(mag_msg->header.stamp, clock_->get_clock_type());
+    has_recent_mag_ = true;
+}
+
+bool EKF_IMU::synchronizeTimestamps(const rclcpp::Time& imu_time, sensor_msgs::msg::MagneticField::SharedPtr& mag) {
+    double time_diff = std::abs((imu_time - last_mag_time_).seconds());
+    if (time_diff < 0.02) {
+        mag = std::make_shared<sensor_msgs::msg::MagneticField>(last_mag_msg_);
+        mag->header.stamp = imu_time;
+        return true;
+    } else {
+        RCLCPP_WARN(get_logger(), "Magnetometer message too old (diff: %.2fs), processing IMU only", time_diff);
+        has_recent_mag_ = false;
+        return false;
+    }
+}
+
+void EKF_IMU::syncedCallback(const sensor_msgs::msg::Imu::SharedPtr imu_msg, const sensor_msgs::msg::MagneticField::SharedPtr mag_msg)
+{
     sensor_msgs::msg::Imu filtered_imu = *imu_msg;
     if (noise_filter_) {
         filtered_imu.linear_acceleration.x = butter_ax_.apply(imu_msg->linear_acceleration.x);
@@ -137,28 +167,12 @@ void EKF_IMU::syncedCallback(const sensor_msgs::msg::Imu::SharedPtr imu_msg, con
         }
     }
 
-    bool valid_mag = mag_msg && (mag_msg->header.stamp.sec != 0 || mag_msg->header.stamp.nanosec != 0);
-    if (use_magnetometer_ && valid_mag) {
-        rclcpp::Time imu_time(imu_msg->header.stamp, clock_->get_clock_type());
-        rclcpp::Time mag_time(mag_msg->header.stamp, clock_->get_clock_type());
-        double time_diff = std::abs((imu_time - mag_time).seconds());
-        if (time_diff < 0.02) {
-            has_recent_mag_ = true;
-            last_mag_msg_ = *mag_msg;
-            last_mag_time_ = mag_time;
-        } else {
-            RCLCPP_WARN(get_logger(), "Magnetometer message too old (diff: %.2fs), processing IMU only", time_diff);
-            valid_mag = false;
-            has_recent_mag_ = false;
-        }
-    } else {
-        has_recent_mag_ = false;
-    }
+    has_recent_mag_ = (mag_msg != nullptr);
 
     if (!initialized_ || last_time_ == rclcpp::Time(0, 0, clock_->get_clock_type())) {
         last_time_ = rclcpp::Time(imu_msg->header.stamp, clock_->get_clock_type());
         last_imu_msg_ = filtered_imu;
-        if (valid_mag) {
+        if (has_recent_mag_) {
             last_mag_msg_ = *mag_msg;
             last_mag_time_ = rclcpp::Time(mag_msg->header.stamp, clock_->get_clock_type());
         }
@@ -168,7 +182,7 @@ void EKF_IMU::syncedCallback(const sensor_msgs::msg::Imu::SharedPtr imu_msg, con
         double a_norm = std::sqrt(ax * ax + ay * ay + az * az);
         RCLCPP_INFO_STREAM(get_logger(), "Initial accelerometer: [" << ax << ", " << ay << ", " << az << "], Norm: " << a_norm);
         if (a_norm > 1e-6 && std::abs(a_norm - 9.81) < 0.3 * 9.81) {
-            if (use_magnetometer_ && valid_mag) {
+            if (use_magnetometer_ && has_recent_mag_) {
                 double mx = (mag_msg->magnetic_field.x * 1e6) - mag_bias_(0);
                 double my = (mag_msg->magnetic_field.y * 1e6) - mag_bias_(1);
                 double mz = (mag_msg->magnetic_field.z * 1e6) - mag_bias_(2);
@@ -222,7 +236,7 @@ void EKF_IMU::syncedCallback(const sensor_msgs::msg::Imu::SharedPtr imu_msg, con
         RCLCPP_WARN(get_logger(), "Invalid dt: %.2fs, resetting timestamp", dt);
         last_time_ = rclcpp::Time(imu_msg->header.stamp, clock_->get_clock_type());
         last_imu_msg_ = filtered_imu;
-        if (valid_mag) {
+        if (has_recent_mag_) {
             last_mag_msg_ = *mag_msg;
             last_mag_time_ = rclcpp::Time(mag_msg->header.stamp, clock_->get_clock_type());
         }
@@ -233,12 +247,12 @@ void EKF_IMU::syncedCallback(const sensor_msgs::msg::Imu::SharedPtr imu_msg, con
     }
     last_time_ = rclcpp::Time(imu_msg->header.stamp, clock_->get_clock_type());
     last_imu_msg_ = filtered_imu;
-    if (valid_mag) {
+    if (has_recent_mag_) {
         last_mag_msg_ = *mag_msg;
         last_mag_time_ = rclcpp::Time(mag_msg->header.stamp, clock_->get_clock_type());
     }
 
-    q_ = update(filtered_imu, use_magnetometer_ && valid_mag && has_recent_mag_ ? &(*mag_msg) : nullptr, dt);
+    q_ = update(filtered_imu, use_magnetometer_ && has_recent_mag_ ? &(*mag_msg) : nullptr, dt);
 
     Eigen::Vector3d a_measured(filtered_imu.linear_acceleration.x, filtered_imu.linear_acceleration.y, filtered_imu.linear_acceleration.z);
     Eigen::Matrix3d R = q2R(q_);
